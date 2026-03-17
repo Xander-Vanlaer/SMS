@@ -1,65 +1,75 @@
-import logging
+from flask import Flask, request, jsonify
+import sqlite3
 import os
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import PlainTextResponse
+app = Flask(__name__)
 
-from app.ai import handle_ai
-from app.weather import handle_weather
+# Database setup
+SMS_DB_PATH = os.getenv('SMS_DB_PATH', '/tmp/sms.db')
 
-load_dotenv()
+def init_db():
+    conn = sqlite3.connect(SMS_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS inbox (id INTEGER PRIMARY KEY, from_number TEXT, body TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, from_number TEXT, body TEXT)''')
+    conn.commit()
+    conn.close()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+@app.route('/sms/inbound', methods=['POST'])
+def inbound():
+    data = request.get_json()
+    from_number = data.get('from_number')
+    body = data.get('body')
+    # Store in inbox
+    conn = sqlite3.connect(SMS_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO inbox (from_number, body) VALUES (?, ?)', (from_number, body))
+    conn.commit()
+    conn.close()
+    reply = 'Received your message.'  # Simple reply logic
+    return jsonify({'reply': reply})
 
-app = FastAPI()
+@app.route('/sms/outbox', methods=['GET'])
+def outbox():
+    conn = sqlite3.connect(SMS_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM outbox')
+    messages = cursor.fetchall()
+    conn.close()
+    return jsonify(messages)
 
+@app.route('/sms/inbox', methods=['GET'])
+def inbox():
+    conn = sqlite3.connect(SMS_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM inbox')
+    messages = cursor.fetchall()
+    conn.close()
+    return jsonify(messages)
 
-def twiml_message(text: str) -> str:
-    """Wrap text in minimal TwiML for an SMS reply."""
-    safe = (text or "").strip().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        f"<Message>{safe}</Message>"
-        "</Response>"
-    )
+@app.route('/sms/send', methods=['POST'])
+def send():
+    data = request.get_json()
+    from_number = data.get('from_number')
+    body = data.get('body')
+    # Store in outbox
+    conn = sqlite3.connect(SMS_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO outbox (from_number, body) VALUES (?, ?)', (from_number, body))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'Message sent'})
 
+@app.route('/sms/reset', methods=['POST'])
+def reset():
+    conn = sqlite3.connect(SMS_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM inbox')
+    cursor.execute('DELETE FROM outbox')
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'Storage cleared'})
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-
-@app.get("/")
-def root():
-    return PlainTextResponse(
-        "AI SMS Assistant is running. POST Twilio webhooks to /twilio/sms\n"
-    )
-
-
-@app.post("/twilio/sms")
-async def twilio_sms(request: Request):
-    """Receive inbound Twilio SMS (application/x-www-form-urlencoded) and reply with TwiML."""
-    form = await request.form()
-    body = (form.get("Body") or "").strip()
-    from_number = (form.get("From") or "").strip()
-
-    if not body:
-        return Response(
-            content=twiml_message("Send a message like: weather 3 days brussels"),
-            media_type="application/xml",
-        )
-
-    lower = body.lower()
-    try:
-        if lower.startswith("weather"):
-            reply = await handle_weather(body)
-        else:
-            reply = await handle_ai(body, from_number=from_number)
-    except Exception:
-        logger.exception("Error processing SMS from %s: %r", from_number, body)
-        reply = "Sorry—something went wrong while processing your request."
-
-    return Response(content=twiml_message(reply), media_type="application/xml")
+if __name__ == '__main__':
+    init_db()
+    app.run(debug=True)
